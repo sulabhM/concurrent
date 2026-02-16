@@ -1,6 +1,8 @@
 /**
- * Lock-free concurrent linked list (Harris-style with hazard pointers).
- * Generic: works on any struct via (void *elm, size_t offset) to the le_next field.
+ * Versioned concurrent linked list.
+ * Each change is tagged with a commit_id. Snapshot at S = all nodes with
+ * insert_txn_id <= S and (removed_txn_id == 0 || removed_txn_id > S).
+ * No copy of nodes for transactions; snapshot is defined by ID.
  */
 
 #include "concurrent_list.h"
@@ -9,136 +11,126 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 
-#define MARK_BIT 1UL
-#define PTR_MASK (~(uintptr_t)MARK_BIT)
+/* Versioned wrapper: list chains these; each holds user element + version ids. */
+typedef struct versioned_node {
+    void *user_elm;
+    uint64_t insert_txn_id;
+    _Atomic uint64_t removed_txn_id;  /* 0 = not removed */
+    atomic_uintptr_t next;
+} versioned_node_t;
 
-static inline void *get_ptr(uintptr_t u)
+static inline versioned_node_t *get_wrapper(uintptr_t u)
 {
-    return (void *)(u & PTR_MASK);
+    return (versioned_node_t *)(u & ~(uintptr_t)1UL);
 }
 
-static inline int is_marked(uintptr_t u)
+static int visible(versioned_node_t *w, uint64_t snapshot_version)
 {
-    return (int)(u & MARK_BIT);
+    if (!w)
+        return 0;
+    uint64_t rid = atomic_load_explicit(&w->removed_txn_id, memory_order_acquire);
+    return w->insert_txn_id <= snapshot_version && (rid == 0 || rid > snapshot_version);
 }
 
-#define ELM_NEXT(elm, off) ((atomic_uintptr_t *)((char *)(elm) + (off)))
-
-void concurrent_list_init_(atomic_uintptr_t *head)
+void concurrent_list_init_(atomic_uintptr_t *head, cl_commit_id_t *commit_id)
 {
     atomic_store_explicit(head, (uintptr_t)0, memory_order_release);
+    atomic_store_explicit(commit_id, 1, memory_order_release);
 }
 
-/* Hazard pointer support */
-#define MAX_HP_THREADS 64
-static _Atomic(void *) hazard_ptrs[MAX_HP_THREADS];
+/* Hazard pointers: 2 slots per thread so we can hold prev and curr during traversal. */
+#define MAX_HP_THREADS 32
+#define HP_SLOTS_PER_THREAD 2
+static _Atomic(void *) hazard_ptrs[MAX_HP_THREADS * HP_SLOTS_PER_THREAD];
 static _Atomic(int) hp_next_index;
-static _Thread_local int my_hp_index = -1;
+static _Thread_local int my_hp_base = -1;
 
-static int get_hp_index(void)
+static int get_hp_base(void)
 {
-    if (my_hp_index >= 0)
-        return my_hp_index;
+    if (my_hp_base >= 0)
+        return my_hp_base;
     int i = atomic_fetch_add(&hp_next_index, 1);
     if (i >= MAX_HP_THREADS)
         return -1;
-    my_hp_index = i;
-    return i;
+    my_hp_base = i * HP_SLOTS_PER_THREAD;
+    return my_hp_base;
 }
 
 static void hp_acquire(void *p)
 {
-    int i = get_hp_index();
+    int i = get_hp_base();
     if (i >= 0)
         atomic_store_explicit(&hazard_ptrs[i], p, memory_order_release);
 }
 
+static void hp_acquire_1(void *p)
+{
+    int i = get_hp_base();
+    if (i >= 0)
+        atomic_store_explicit(&hazard_ptrs[i + 1], p, memory_order_release);
+}
+
 static void hp_release(void)
 {
-    int i = get_hp_index();
-    if (i >= 0)
+    int i = get_hp_base();
+    if (i >= 0) {
         atomic_store_explicit(&hazard_ptrs[i], NULL, memory_order_release);
-}
-
-static int hp_can_retire(void *p)
-{
-    for (int i = 0; i < MAX_HP_THREADS; i++) {
-        if (atomic_load_explicit(&hazard_ptrs[i], memory_order_acquire) == p)
-            return 0;
+        atomic_store_explicit(&hazard_ptrs[i + 1], NULL, memory_order_release);
     }
-    return 1;
 }
 
-/* Retire list: when free_cb is set we call it on reclaim. One free_cb per thread (last passed). */
-#define RETIRE_CAP 256
-static _Thread_local void *retire_ptrs[RETIRE_CAP];
-static _Thread_local int retire_count;
-static _Thread_local void (*retire_cb)(void *);
-
-static void retire_node(void *elm, void (*free_cb)(void *))
+void concurrent_list_insert_head_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void *elm)
 {
-    retire_cb = free_cb;
-    if (retire_count >= RETIRE_CAP) {
-        int j = 0;
-        for (int i = 0; i < retire_count; i++) {
-            void *p = retire_ptrs[i];
-            if (hp_can_retire(p)) {
-                if (retire_cb)
-                    retire_cb(p);
-            } else {
-                retire_ptrs[j++] = p;
-            }
-        }
-        retire_count = j;
-    }
-    if (retire_count < RETIRE_CAP)
-        retire_ptrs[retire_count++] = elm;
-}
-
-void concurrent_list_insert_head_(atomic_uintptr_t *head, void *elm, size_t offset)
-{
-    atomic_uintptr_t *elm_next = ELM_NEXT(elm, offset);
+    uint64_t C = atomic_fetch_add_explicit(commit_id, 1, memory_order_acq_rel);
+    versioned_node_t *w = (versioned_node_t *)aligned_alloc(alignof(versioned_node_t), sizeof(versioned_node_t));
+    if (!w)
+        return;
+    w->user_elm = elm;
+    w->insert_txn_id = C;
+    atomic_store_explicit(&w->removed_txn_id, (uint64_t)0, memory_order_release);
     uintptr_t old_head;
     do {
         old_head = atomic_load_explicit(head, memory_order_acquire);
-        atomic_store_explicit(elm_next, old_head, memory_order_release);
-    } while (!atomic_compare_exchange_weak_explicit(head, &old_head, (uintptr_t)elm,
+        atomic_store_explicit(&w->next, old_head, memory_order_release);
+    } while (!atomic_compare_exchange_weak_explicit(head, &old_head, (uintptr_t)w,
                                                     memory_order_release, memory_order_acquire));
 }
 
-void concurrent_list_insert_tail_(atomic_uintptr_t *head, void *elm, size_t offset)
+void concurrent_list_insert_tail_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void *elm)
 {
-    atomic_uintptr_t *elm_next = ELM_NEXT(elm, offset);
-    atomic_store_explicit(elm_next, (uintptr_t)NULL, memory_order_release);
+    uint64_t C = atomic_fetch_add_explicit(commit_id, 1, memory_order_acq_rel);
+    versioned_node_t *w = (versioned_node_t *)aligned_alloc(alignof(versioned_node_t), sizeof(versioned_node_t));
+    if (!w)
+        return;
+    w->user_elm = elm;
+    w->insert_txn_id = C;
+    atomic_store_explicit(&w->removed_txn_id, (uint64_t)0, memory_order_release);
+    atomic_store_explicit(&w->next, (uintptr_t)0, memory_order_release);
     for (;;) {
         uintptr_t head_val = atomic_load_explicit(head, memory_order_acquire);
-        void *head_node = get_ptr(head_val);
-        if (!head_node) {
-            if (atomic_compare_exchange_weak_explicit(head, &head_val, (uintptr_t)elm,
+        versioned_node_t *curr = get_wrapper(head_val);
+        if (!curr) {
+            if (atomic_compare_exchange_weak_explicit(head, &head_val, (uintptr_t)w,
                                                       memory_order_release, memory_order_acquire))
                 return;
             continue;
         }
-        hp_acquire(head_node);
+        hp_acquire(curr);
         if (atomic_load_explicit(head, memory_order_acquire) != head_val) {
             hp_release();
             continue;
         }
-        void *curr = head_node;
+        versioned_node_t *prev = curr;
         for (;;) {
-            uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-            void *next_node = get_ptr(next_val);
-            if (is_marked(next_val)) {
-                curr = next_node;
-                continue;
-            }
-            if (!next_node)
+            uintptr_t next_val = atomic_load_explicit(&prev->next, memory_order_acquire);
+            versioned_node_t *next = get_wrapper(next_val);
+            if (!next)
                 break;
-            hp_acquire(next_node);
-            curr = next_node;
+            hp_acquire(next);
+            prev = next;
         }
-        uintptr_t expected = (uintptr_t)NULL;
-        if (atomic_compare_exchange_weak_explicit(ELM_NEXT(curr, offset), &expected, (uintptr_t)elm,
+        uintptr_t expected = (uintptr_t)0;
+        if (atomic_compare_exchange_weak_explicit(&prev->next, &expected, (uintptr_t)w,
                                                   memory_order_release, memory_order_acquire)) {
             hp_release();
             return;
@@ -147,155 +139,141 @@ void concurrent_list_insert_tail_(atomic_uintptr_t *head, void *elm, size_t offs
     }
 }
 
-void *concurrent_list_remove_head_(atomic_uintptr_t *head, size_t offset)
+void *concurrent_list_remove_head_(atomic_uintptr_t *head, cl_commit_id_t *commit_id)
 {
-    void *head_node;
-    uintptr_t head_val;
-    do {
-        head_val = atomic_load_explicit(head, memory_order_acquire);
-        head_node = get_ptr(head_val);
-        if (!head_node)
-            return NULL;
-        uintptr_t next_val = atomic_load_explicit(ELM_NEXT(head_node, offset), memory_order_acquire);
-        if (is_marked(next_val))
-            continue;
-        if (!atomic_compare_exchange_weak_explicit(head, &head_val, next_val,
-                                                    memory_order_release, memory_order_acquire))
-            continue;
-        return head_node;
-    } while (1);
-}
-
-static int mark_node(void *node, size_t offset)
-{
-    atomic_uintptr_t *node_next = ELM_NEXT(node, offset);
-    uintptr_t next_val;
-    do {
-        next_val = atomic_load_explicit(node_next, memory_order_acquire);
-        if (is_marked(next_val))
-            return 0;
-    } while (!atomic_compare_exchange_weak_explicit(node_next, &next_val, next_val | MARK_BIT,
-                                                    memory_order_release, memory_order_acquire));
-    return 1;
-}
-
-int concurrent_list_remove_(atomic_uintptr_t *head, void (*free_cb)(void *), void *elm, size_t offset)
-{
+    uint64_t S = atomic_load_explicit(commit_id, memory_order_acquire);
     for (;;) {
         uintptr_t head_val = atomic_load_explicit(head, memory_order_acquire);
-        void *head_node = get_ptr(head_val);
-        if (!head_node)
-            return -1;
-        hp_acquire(head_node);
+        versioned_node_t *w = get_wrapper(head_val);
+        if (!w)
+            return NULL;
+        hp_acquire(w);
         if (atomic_load_explicit(head, memory_order_acquire) != head_val) {
             hp_release();
             continue;
         }
-        void *curr = head_node;
-        void *prev = NULL;
-        atomic_uintptr_t *atom_ptr = head;
-        uintptr_t expected = head_val;
-        for (;;) {
-            uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-            void *next_node = get_ptr(next_val);
-            if (is_marked(next_val)) {
-                uintptr_t unmarked = (uintptr_t)next_node;
-                if (!atomic_compare_exchange_weak_explicit(atom_ptr, &expected, unmarked,
-                                                          memory_order_release, memory_order_acquire))
-                    break;
-                curr = next_node;
-                if (!curr) {
-                    hp_release();
-                    return -1;
-                }
-                continue;
-            }
-            if (curr == elm) {
-                if (!mark_node(curr, offset)) {
-                    hp_release();
-                    continue;
-                }
-                uintptr_t unmarked_next = (uintptr_t)next_node;
-                if (atomic_compare_exchange_weak_explicit(atom_ptr, &expected, unmarked_next,
-                                                          memory_order_release, memory_order_acquire)) {
-                    hp_release();
-                    retire_node(curr, free_cb);
-                    return 0;
-                }
+        if (visible(w, S)) {
+            uintptr_t next_val = atomic_load_explicit(&w->next, memory_order_acquire);
+            if (atomic_compare_exchange_weak_explicit(head, &head_val, next_val,
+                                                      memory_order_release, memory_order_acquire)) {
+                void *user = w->user_elm;
                 hp_release();
-                continue;
+                free(w);
+                return user;
+            }
+            hp_release();
+            continue;
+        }
+        /* Head not visible; traverse to find first visible and unlink it. */
+        versioned_node_t *prev = w;
+        versioned_node_t *curr = get_wrapper(atomic_load_explicit(&w->next, memory_order_acquire));
+        int cas_failed = 0;
+        while (curr) {
+            hp_acquire_1(curr);
+            if (visible(curr, S)) {
+                uintptr_t unmarked = (uintptr_t)get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
+                uintptr_t prev_next = (uintptr_t)curr;
+                if (atomic_compare_exchange_weak_explicit(&prev->next, &prev_next, unmarked,
+                                                          memory_order_release, memory_order_acquire)) {
+                    void *user = curr->user_elm;
+                    hp_release();
+                    free(curr);
+                    return user;
+                }
+                cas_failed = 1;
+                break;
             }
             prev = curr;
-            atom_ptr = ELM_NEXT(curr, offset);
-            expected = next_val;
-            curr = next_node;
-            if (!curr) {
-                hp_release();
-                return -1;
-            }
-            hp_acquire(curr);
+            curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
         }
         hp_release();
+        if (cas_failed)
+            continue;  /* Retry outer loop */
+        return NULL;   /* No visible node (list logically empty) */
     }
 }
 
-bool concurrent_list_contains_(atomic_uintptr_t *head, const void *elm, size_t offset)
+int concurrent_list_remove_(atomic_uintptr_t *head, cl_commit_id_t *commit_id,
+                            void (*free_cb)(void *), void *elm)
 {
-    void *curr = get_ptr(atomic_load_explicit(head, memory_order_acquire));
+    (void)free_cb;
+    uint64_t C = atomic_fetch_add_explicit(commit_id, 1, memory_order_acq_rel);
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(head, memory_order_acquire));
     while (curr) {
-        uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-        if (!is_marked(next_val) && curr == elm)
+        if (curr->user_elm == elm) {
+            atomic_store_explicit(&curr->removed_txn_id, C, memory_order_release);
+            return 0;
+        }
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
+    }
+    return -1;
+}
+
+bool concurrent_list_contains_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, const void *elm)
+{
+    uint64_t S = atomic_load_explicit(commit_id, memory_order_acquire);
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(head, memory_order_acquire));
+    while (curr) {
+        if (curr->user_elm == elm && visible(curr, S))
             return true;
-        curr = get_ptr(next_val);
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
     }
     return false;
 }
 
 bool concurrent_list_is_empty_(atomic_uintptr_t *head)
 {
-    return get_ptr(atomic_load_explicit(head, memory_order_acquire)) == NULL;
+    return get_wrapper(atomic_load_explicit(head, memory_order_acquire)) == NULL;
 }
 
-size_t concurrent_list_size_(atomic_uintptr_t *head, size_t offset)
+size_t concurrent_list_size_(atomic_uintptr_t *head, cl_commit_id_t *commit_id)
 {
+    uint64_t S = atomic_load_explicit(commit_id, memory_order_acquire);
     size_t n = 0;
-    void *curr = get_ptr(atomic_load_explicit(head, memory_order_acquire));
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(head, memory_order_acquire));
     while (curr) {
-        uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-        if (!is_marked(next_val))
+        if (visible(curr, S))
             n++;
-        curr = get_ptr(next_val);
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
     }
     return n;
 }
 
-void *concurrent_list_first_(atomic_uintptr_t *head, size_t offset)
+/* --- Iterator (snapshot at current commit_id) --- */
+
+void concurrent_list_iter_begin(concurrent_list_iter_t *it,
+    atomic_uintptr_t *head, cl_commit_id_t *commit_id)
 {
-    void *curr = get_ptr(atomic_load_explicit(head, memory_order_acquire));
-    while (curr) {
-        uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-        if (!is_marked(next_val))
-            return curr;
-        curr = get_ptr(next_val);
-    }
-    return NULL;
+    it->head = head;
+    it->commit_id = commit_id;
+    it->snapshot_version = atomic_load_explicit(commit_id, memory_order_acquire);
+    it->begun = 1;
+    it->cur = get_wrapper(atomic_load_explicit(head, memory_order_acquire));
+    while (it->cur && !visible((versioned_node_t *)it->cur, it->snapshot_version))
+        it->cur = get_wrapper(atomic_load_explicit(&((versioned_node_t *)it->cur)->next, memory_order_acquire));
 }
 
-void *concurrent_list_next_(void *elm, size_t offset)
+bool concurrent_list_iter_has(concurrent_list_iter_t *it)
 {
-    if (!elm)
-        return NULL;
-    void *curr = get_ptr(atomic_load_explicit(ELM_NEXT(elm, offset), memory_order_acquire));
-    while (curr) {
-        uintptr_t next_val = atomic_load_explicit(ELM_NEXT(curr, offset), memory_order_acquire);
-        if (!is_marked(next_val))
-            return curr;
-        curr = get_ptr(next_val);
-    }
-    return NULL;
+    return it->cur != NULL;
 }
 
-/* --- Transaction support --- */
+void concurrent_list_iter_next(concurrent_list_iter_t *it)
+{
+    if (!it->cur)
+        return;
+    versioned_node_t *w = (versioned_node_t *)it->cur;
+    it->cur = get_wrapper(atomic_load_explicit(&w->next, memory_order_acquire));
+    while (it->cur && !visible((versioned_node_t *)it->cur, it->snapshot_version))
+        it->cur = get_wrapper(atomic_load_explicit(&((versioned_node_t *)it->cur)->next, memory_order_acquire));
+}
+
+void *concurrent_list_iter_get(concurrent_list_iter_t *it)
+{
+    return it->cur ? ((versioned_node_t *)it->cur)->user_elm : NULL;
+}
+
+/* --- Transaction: snapshot = commit_id at start; no copy --- */
 
 #define TXN_INIT_CAP 8
 
@@ -334,10 +312,9 @@ static void remove_from(void **arr, size_t *n, const void *ptr)
 
 struct concurrent_list_txn {
     atomic_uintptr_t *head;
+    cl_commit_id_t *commit_id;
     void (*free_cb)(void *);
-    size_t offset;
-    void **snapshot;
-    size_t n_snapshot;
+    uint64_t snapshot_version;   /* snapshot at this id; no copy */
     void **inserted_head;
     size_t n_ins_head;
     size_t cap_ins_head;
@@ -350,29 +327,15 @@ struct concurrent_list_txn {
 };
 
 concurrent_list_txn_t *concurrent_list_txn_start_(atomic_uintptr_t *head,
-    void (*free_cb)(void *), size_t offset)
+    cl_commit_id_t *commit_id, void (*free_cb)(void *))
 {
     concurrent_list_txn_t *txn = (concurrent_list_txn_t *)calloc(1, sizeof(*txn));
     if (!txn)
         return NULL;
     txn->head = head;
+    txn->commit_id = commit_id;
     txn->free_cb = free_cb;
-    txn->offset = offset;
-    /* inserted_* and removed start empty; append() will allocate on first use */
-
-    size_t cap = 0;
-    void *curr = concurrent_list_first_(head, offset);
-    while (curr) {
-        if (append(&txn->snapshot, &txn->n_snapshot, &cap, curr) != 0) {
-            free(txn->snapshot);
-            free(txn->inserted_head);
-            free(txn->inserted_tail);
-            free(txn->removed);
-            free(txn);
-            return NULL;
-        }
-        curr = concurrent_list_next_(curr, offset);
-    }
+    txn->snapshot_version = atomic_load_explicit(commit_id, memory_order_acquire);
     return txn;
 }
 
@@ -396,8 +359,15 @@ void concurrent_list_txn_remove_(concurrent_list_txn_t *txn, void *elm)
         remove_from(txn->inserted_tail, &txn->n_ins_tail, elm);
         return;
     }
-    if (ptr_in(txn->snapshot, txn->n_snapshot, elm) && !ptr_in(txn->removed, txn->n_removed, elm))
-        append(&txn->removed, &txn->n_removed, &txn->cap_removed, elm);
+    /* Check if elm is in list at snapshot_version (traverse once). */
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(txn->head, memory_order_acquire));
+    while (curr) {
+        if (curr->user_elm == elm && visible(curr, txn->snapshot_version)) {
+            append(&txn->removed, &txn->n_removed, &txn->cap_removed, elm);
+            return;
+        }
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
+    }
 }
 
 bool concurrent_list_txn_contains_(concurrent_list_txn_t *txn, const void *elm)
@@ -406,18 +376,26 @@ bool concurrent_list_txn_contains_(concurrent_list_txn_t *txn, const void *elm)
         return true;
     if (ptr_in(txn->inserted_tail, txn->n_ins_tail, elm))
         return true;
-    if (ptr_in(txn->snapshot, txn->n_snapshot, elm) && !ptr_in(txn->removed, txn->n_removed, elm))
-        return true;
+    if (ptr_in(txn->removed, txn->n_removed, elm))
+        return false;
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(txn->head, memory_order_acquire));
+    while (curr) {
+        if (curr->user_elm == elm && visible(curr, txn->snapshot_version))
+            return true;
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
+    }
     return false;
 }
 
 void concurrent_list_txn_foreach_(concurrent_list_txn_t *txn,
     concurrent_list_txn_foreach_fn cb, void *userdata)
 {
-    for (size_t i = 0; i < txn->n_snapshot; i++) {
-        void *p = txn->snapshot[i];
-        if (!ptr_in(txn->removed, txn->n_removed, p))
-            cb(p, userdata);
+    /* Snapshot: walk list at snapshot_version (no copy). */
+    versioned_node_t *curr = get_wrapper(atomic_load_explicit(txn->head, memory_order_acquire));
+    while (curr) {
+        if (visible(curr, txn->snapshot_version) && !ptr_in(txn->removed, txn->n_removed, curr->user_elm))
+            cb(curr->user_elm, userdata);
+        curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
     }
     for (size_t i = txn->n_ins_head; i > 0; i--)
         cb(txn->inserted_head[i - 1], userdata);
@@ -427,18 +405,21 @@ void concurrent_list_txn_foreach_(concurrent_list_txn_t *txn,
 
 int concurrent_list_txn_commit(concurrent_list_txn_t *txn)
 {
-    atomic_uintptr_t *head = txn->head;
-    size_t offset = txn->offset;
-    void (*free_cb)(void *) = txn->free_cb;
-
-    for (size_t i = 0; i < txn->n_removed; i++)
-        concurrent_list_remove_(head, free_cb, txn->removed[i], offset);
+    uint64_t C = atomic_fetch_add_explicit(txn->commit_id, 1, memory_order_acq_rel);
+    for (size_t i = 0; i < txn->n_removed; i++) {
+        versioned_node_t *curr = get_wrapper(atomic_load_explicit(txn->head, memory_order_acquire));
+        while (curr) {
+            if (curr->user_elm == txn->removed[i]) {
+                atomic_store_explicit(&curr->removed_txn_id, C, memory_order_release);
+                break;
+            }
+            curr = get_wrapper(atomic_load_explicit(&curr->next, memory_order_acquire));
+        }
+    }
     for (size_t i = 0; i < txn->n_ins_tail; i++)
-        concurrent_list_insert_tail_(head, txn->inserted_tail[i], offset);
+        concurrent_list_insert_tail_(txn->head, txn->commit_id, txn->inserted_tail[i]);
     for (size_t i = txn->n_ins_head; i > 0; i--)
-        concurrent_list_insert_head_(head, txn->inserted_head[i - 1], offset);
-
-    free(txn->snapshot);
+        concurrent_list_insert_head_(txn->head, txn->commit_id, txn->inserted_head[i - 1]);
     free(txn->inserted_head);
     free(txn->inserted_tail);
     free(txn->removed);
@@ -448,7 +429,6 @@ int concurrent_list_txn_commit(concurrent_list_txn_t *txn)
 
 void concurrent_list_txn_rollback(concurrent_list_txn_t *txn)
 {
-    free(txn->snapshot);
     free(txn->inserted_head);
     free(txn->inserted_tail);
     free(txn->removed);

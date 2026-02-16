@@ -18,6 +18,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Commit ID type (64-bit when available). */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+typedef _Atomic(uint64_t) cl_commit_id_t;
+#else
+typedef _Atomic(unsigned long long) cl_commit_id_t;
+#endif
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,8 +45,9 @@ extern "C" {
  */
 #define CONCURRENT_LIST_HEAD(name, type)          \
     struct name {                                \
-        atomic_uintptr_t head;                   \
-        void (*free_cb)(struct type *);         \
+        atomic_uintptr_t head;                    \
+        cl_commit_id_t commit_id;                 \
+        void (*free_cb)(struct type *);           \
     }
 
 /*
@@ -46,8 +55,8 @@ extern "C" {
  */
 #define CONCURRENT_LIST_INIT(headp)                \
     do {                                          \
-        concurrent_list_init_(&((headp)->head));   \
-        (headp)->free_cb = NULL;                    \
+        concurrent_list_init_(&((headp)->head), &((headp)->commit_id)); \
+        (headp)->free_cb = NULL;                  \
     } while (0)
 
 /*
@@ -62,15 +71,13 @@ extern "C" {
     ({ __typeof__(elm) _e = (elm); (size_t)offsetof(__typeof__(*_e), field); })
 
 #define CONCURRENT_LIST_INSERT_HEAD(headp, elm, field)                   \
-    concurrent_list_insert_head_(&((headp)->head), (void *)(elm),        \
-        CONCURRENT_LIST_OFFSET(elm, field))
+    concurrent_list_insert_head_(&((headp)->head), &((headp)->commit_id), (void *)(elm))
 
 /*
  * Insert element at the tail.
  */
 #define CONCURRENT_LIST_INSERT_TAIL(headp, elm, field)                   \
-    concurrent_list_insert_tail_(&((headp)->head), (void *)(elm),         \
-        CONCURRENT_LIST_OFFSET(elm, field))
+    concurrent_list_insert_tail_(&((headp)->head), &((headp)->commit_id), (void *)(elm))
 
 /*
  * Remove and return the element at the head. Returns NULL if empty.
@@ -78,7 +85,7 @@ extern "C" {
  * Caller may free the returned element when no longer needed.
  */
 #define CONCURRENT_LIST_REMOVE_HEAD(headp, type, field)                  \
-    ((type *)concurrent_list_remove_head_(&((headp)->head), (size_t)offsetof(type, field)))
+    ((type *)concurrent_list_remove_head_(&((headp)->head), &((headp)->commit_id)))
 
 /*
  * Remove the given element from the list. If head->free_cb is set, it will be
@@ -86,15 +93,13 @@ extern "C" {
  * not free the element until no thread can reference it (e.g. by design).
  */
 #define CONCURRENT_LIST_REMOVE(headp, elm, field)                        \
-    concurrent_list_remove_(&((headp)->head), (headp)->free_cb, (void *)(elm), \
-        CONCURRENT_LIST_OFFSET(elm, field))
+    concurrent_list_remove_(&((headp)->head), &((headp)->commit_id), (headp)->free_cb, (void *)(elm))
 
 /*
  * Return true if "elm" is in the list (by pointer equality).
  */
 #define CONCURRENT_LIST_CONTAINS(headp, elm, field)                       \
-    concurrent_list_contains_(&((headp)->head), (void *)(elm),           \
-        CONCURRENT_LIST_OFFSET(elm, field))
+    concurrent_list_contains_(&((headp)->head), &((headp)->commit_id), (void *)(elm))
 
 /*
  * Return true if the list is empty.
@@ -106,17 +111,35 @@ extern "C" {
  * "type" is the element struct type; "field" is the list entry member name.
  */
 #define CONCURRENT_LIST_SIZE(headp, type, field)                         \
-    concurrent_list_size_(&((headp)->head), (size_t)offsetof(type, field))
+    concurrent_list_size_(&((headp)->head), &((headp)->commit_id))
 
 /*
- * Traverse the list. "var" is the loop variable (pointer to element); "type"
- * is the element struct type; "field" is the list entry member name. Skips
- * logically deleted nodes. Do not remove "var" from the list during the loop.
+ * Iterator for versioned traversal (snapshot at current commit_id).
+ * Do not remove elements during iteration.
+ */
+typedef struct concurrent_list_iter {
+    int begun;
+    void *cur;           /* current versioned_node *; internal */
+    atomic_uintptr_t *head;
+    cl_commit_id_t *commit_id;
+    uint64_t snapshot_version;
+} concurrent_list_iter_t;
+
+void concurrent_list_iter_begin(concurrent_list_iter_t *it,
+    atomic_uintptr_t *head, cl_commit_id_t *commit_id);
+bool concurrent_list_iter_has(concurrent_list_iter_t *it);
+void concurrent_list_iter_next(concurrent_list_iter_t *it);
+void *concurrent_list_iter_get(concurrent_list_iter_t *it);
+
+/*
+ * Traverse the list at current snapshot. "var" is the loop variable.
  */
 #define CONCURRENT_LIST_FOREACH(var, headp, type, field)                  \
-    for ((var) = (type *)concurrent_list_first_(&((headp)->head), (size_t)offsetof(type, field)); \
-         (var) != NULL;                                                   \
-         (var) = (type *)concurrent_list_next_((void *)(var), (size_t)offsetof(type, field)))
+    for (concurrent_list_iter_t _cl_it = {0};                             \
+         (void)(!_cl_it.begun && (concurrent_list_iter_begin(&_cl_it, &((headp)->head), &((headp)->commit_id)), 0)), \
+         concurrent_list_iter_has(&_cl_it);                               \
+         concurrent_list_iter_next(&_cl_it))                              \
+        if (((var) = (type *)concurrent_list_iter_get(&_cl_it)) != NULL)
 
 /*
  * --- Transactions ---
@@ -136,8 +159,7 @@ typedef void (*concurrent_list_txn_foreach_fn)(void *elm, void *userdata);
  * continue to add/remove. Returns NULL on allocation failure.
  */
 #define CONCURRENT_LIST_TXN_START(headp, type, field)                     \
-    concurrent_list_txn_start_(&((headp)->head), (void (*)(void *))(headp)->free_cb, \
-        (size_t)offsetof(type, field))
+    concurrent_list_txn_start_(&((headp)->head), &((headp)->commit_id), (void (*)(void *))(headp)->free_cb)
 
 /**
  * Insert at head (in transaction view). Applied to the list on commit.
@@ -184,7 +206,7 @@ void concurrent_list_txn_rollback(concurrent_list_txn_t *txn);
 
 /* Internal (used by macros). */
 concurrent_list_txn_t *concurrent_list_txn_start_(atomic_uintptr_t *head,
-    void (*free_cb)(void *), size_t offset);
+    cl_commit_id_t *commit_id, void (*free_cb)(void *));
 void concurrent_list_txn_insert_head_(concurrent_list_txn_t *txn, void *elm);
 void concurrent_list_txn_insert_tail_(concurrent_list_txn_t *txn, void *elm);
 void concurrent_list_txn_remove_(concurrent_list_txn_t *txn, void *elm);
@@ -192,17 +214,15 @@ bool concurrent_list_txn_contains_(concurrent_list_txn_t *txn, const void *elm);
 void concurrent_list_txn_foreach_(concurrent_list_txn_t *txn,
     concurrent_list_txn_foreach_fn cb, void *userdata);
 
-/* Internal API (used by macros; do not call directly with wrong offset). */
-void concurrent_list_init_(atomic_uintptr_t *head);
-void concurrent_list_insert_head_(atomic_uintptr_t *head, void *elm, size_t offset);
-void concurrent_list_insert_tail_(atomic_uintptr_t *head, void *elm, size_t offset);
-void *concurrent_list_remove_head_(atomic_uintptr_t *head, size_t offset);
-int concurrent_list_remove_(atomic_uintptr_t *head, void (*free_cb)(void *), void *elm, size_t offset);
-bool concurrent_list_contains_(atomic_uintptr_t *head, const void *elm, size_t offset);
+/* Internal API: list uses versioned wrappers; commit_id tags each change. */
+void concurrent_list_init_(atomic_uintptr_t *head, cl_commit_id_t *commit_id);
+void concurrent_list_insert_head_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void *elm);
+void concurrent_list_insert_tail_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void *elm);
+void *concurrent_list_remove_head_(atomic_uintptr_t *head, cl_commit_id_t *commit_id);
+int concurrent_list_remove_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void (*free_cb)(void *), void *elm);
+bool concurrent_list_contains_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, const void *elm);
 bool concurrent_list_is_empty_(atomic_uintptr_t *head);
-size_t concurrent_list_size_(atomic_uintptr_t *head, size_t offset);
-void *concurrent_list_first_(atomic_uintptr_t *head, size_t offset);
-void *concurrent_list_next_(void *elm, size_t offset);
+size_t concurrent_list_size_(atomic_uintptr_t *head, cl_commit_id_t *commit_id);
 
 #ifdef __cplusplus
 }

@@ -7,7 +7,7 @@ A lock-free, thread-safe singly linked list in C using C11 atomics. The API is g
 - **Lock-free**: Harris-style list with hazard pointers; no mutexes.
 - **Generic**: Works with any struct; you define the element type and embed `CONCURRENT_LIST_ENTRY(type, name)`.
 - **BSD-style macros**: Similar to `sys/queue.h` (e.g. `CONCURRENT_LIST_INSERT_HEAD`, `CONCURRENT_LIST_REMOVE_HEAD`, `CONCURRENT_LIST_FOREACH`).
-- **Transactions**: Start a transaction to see a snapshot of the list; other threads can keep modifying the list. Buffered inserts/removes are applied on commit or discarded on rollback.
+- **Transactions**: Snapshot is defined by a **commit ID** (no copy of nodes). Each change (insert/remove) is tagged with a monotonic commit ID. A snapshot at ID S sees all nodes with `insert_txn_id <= S` and not removed at or before S (`removed_txn_id == 0 || removed_txn_id > S`). Starting a transaction records the current commit ID; you walk the list filtered by that ID. Buffered inserts/removes are applied on commit (with a new ID) or discarded on rollback.
 
 ## Build
 
@@ -44,16 +44,18 @@ struct item *p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link);
 if (p) free(p);
 ```
 
-### Transactions
+### Transactions (ID-based snapshot)
+
+The list uses **versioned wrappers**: each element is stored in a wrapper with `insert_txn_id` and `removed_txn_id`. The list head has a `commit_id` that increments on every commit. A snapshot at ID S = "all changes committed with id ≤ S": a node is visible iff `insert_txn_id ≤ S` and (`removed_txn_id == 0` or `removed_txn_id > S`). No copy of nodes: you traverse the list and filter by S.
 
 ```c
 concurrent_list_txn_t *txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
 if (txn) {
-    /* Walk snapshot; other threads can add/remove meanwhile */
+    /* Snapshot = list at commit_id when txn started; other threads can add/remove */
     CONCURRENT_LIST_TXN_FOREACH(txn, my_callback, userdata);
     CONCURRENT_LIST_TXN_INSERT_TAIL(txn, new_elm, link);
     CONCURRENT_LIST_TXN_REMOVE(txn, old_elm, link);
-    concurrent_list_txn_commit(txn);   /* apply changes */
+    concurrent_list_txn_commit(txn);   /* gets new commit_id, applies changes */
     /* or concurrent_list_txn_rollback(txn); to discard */
 }
 ```
