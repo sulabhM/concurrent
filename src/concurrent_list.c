@@ -79,6 +79,90 @@ static void hp_release(void)
     }
 }
 
+/* Active snapshot versions for reclaim: only free nodes removed before min(active). */
+static _Atomic(uint64_t) active_snapshot_version[MAX_HP_THREADS];
+
+static uint64_t min_active_snapshot(void)
+{
+    uint64_t min = UINT64_MAX;
+    for (int i = 0; i < MAX_HP_THREADS; i++) {
+        uint64_t v = atomic_load_explicit(&active_snapshot_version[i], memory_order_acquire);
+        if (v != 0 && v < min)
+            min = v;
+    }
+    return min;  /* UINT64_MAX if no active txns */
+}
+
+/* Thread-local list of unlinked nodes waiting to be freed when no hp references them. */
+static _Thread_local versioned_node_t *retired_list;
+
+static int any_hp_equals(void *p)
+{
+    for (int i = 0; i < MAX_HP_THREADS * HP_SLOTS_PER_THREAD; i++) {
+        if (atomic_load_explicit(&hazard_ptrs[i], memory_order_acquire) == p)
+            return 1;
+    }
+    return 0;
+}
+
+static void reclaim(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void (*free_cb)(void *))
+{
+    uint64_t min_active = min_active_snapshot();
+    if (min_active == UINT64_MAX)
+        min_active = atomic_load_explicit(commit_id, memory_order_acquire);
+    versioned_node_t *prev = NULL;
+    uintptr_t prev_next = atomic_load_explicit(head, memory_order_acquire);
+    versioned_node_t *curr = get_wrapper(prev_next);
+    while (curr) {
+        uint64_t rid = atomic_load_explicit(&curr->removed_txn_id, memory_order_acquire);
+        int reclaimable = (rid != 0 && rid < min_active);
+        uintptr_t next_val = atomic_load_explicit(&curr->next, memory_order_acquire);
+        versioned_node_t *next = get_wrapper(next_val);
+        if (reclaimable) {
+            hp_acquire(curr);
+            uintptr_t unlink_val = (uintptr_t)curr;
+            int unlinked = 0;
+            if (prev) {
+                if (atomic_compare_exchange_weak_explicit(&prev->next, &unlink_val, next_val,
+                                                          memory_order_release, memory_order_acquire))
+                    unlinked = 1;
+            } else {
+                if (atomic_compare_exchange_weak_explicit(head, &unlink_val, next_val,
+                                                          memory_order_release, memory_order_acquire))
+                    unlinked = 1;
+            }
+            if (unlinked) {
+                hp_release();
+                /* Push to retire list; free only when no hazard ptr references this node. */
+                atomic_store_explicit(&curr->next, (uintptr_t)retired_list, memory_order_release);
+                retired_list = curr;
+                curr = next;
+                continue;
+            }
+            hp_release();
+        }
+        prev = curr;
+        prev_next = (uintptr_t)curr;
+        curr = next;
+    }
+    /* Free retired nodes that no hazard ptr references. */
+    versioned_node_t *still_held = NULL;
+    while (retired_list) {
+        versioned_node_t *n = retired_list;
+        retired_list = get_wrapper(atomic_load_explicit(&n->next, memory_order_acquire));
+        if (any_hp_equals(n)) {
+            atomic_store_explicit(&n->next, (uintptr_t)still_held, memory_order_release);
+            still_held = n;
+        } else {
+            void *user = n->user_elm;
+            free(n);
+            if (free_cb)
+                free_cb(user);
+        }
+    }
+    retired_list = still_held;
+}
+
 void concurrent_list_insert_head_(atomic_uintptr_t *head, cl_commit_id_t *commit_id, void *elm)
 {
     uint64_t C = atomic_fetch_add_explicit(commit_id, 1, memory_order_acq_rel);
@@ -336,6 +420,10 @@ concurrent_list_txn_t *concurrent_list_txn_start_(atomic_uintptr_t *head,
     txn->commit_id = commit_id;
     txn->free_cb = free_cb;
     txn->snapshot_version = atomic_load_explicit(commit_id, memory_order_acquire);
+    /* Register so reclaim won't free nodes visible to this snapshot. */
+    int base = get_hp_base();
+    if (base >= 0)
+        atomic_store_explicit(&active_snapshot_version[base / HP_SLOTS_PER_THREAD], txn->snapshot_version, memory_order_release);
     return txn;
 }
 
@@ -420,6 +508,11 @@ int concurrent_list_txn_commit(concurrent_list_txn_t *txn)
         concurrent_list_insert_tail_(txn->head, txn->commit_id, txn->inserted_tail[i]);
     for (size_t i = txn->n_ins_head; i > 0; i--)
         concurrent_list_insert_head_(txn->head, txn->commit_id, txn->inserted_head[i - 1]);
+    /* Unregister snapshot, then reclaim removed nodes not visible to any active txn. */
+    int base = get_hp_base();
+    if (base >= 0)
+        atomic_store_explicit(&active_snapshot_version[base / HP_SLOTS_PER_THREAD], (uint64_t)0, memory_order_release);
+    reclaim(txn->head, txn->commit_id, txn->free_cb);
     free(txn->inserted_head);
     free(txn->inserted_tail);
     free(txn->removed);
@@ -429,6 +522,9 @@ int concurrent_list_txn_commit(concurrent_list_txn_t *txn)
 
 void concurrent_list_txn_rollback(concurrent_list_txn_t *txn)
 {
+    int base = get_hp_base();
+    if (base >= 0)
+        atomic_store_explicit(&active_snapshot_version[base / HP_SLOTS_PER_THREAD], (uint64_t)0, memory_order_release);
     free(txn->inserted_head);
     free(txn->inserted_tail);
     free(txn->removed);
