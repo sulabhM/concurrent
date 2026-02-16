@@ -21,6 +21,12 @@ static struct list_head lst;
 
 static struct list_head *g_lst;
 
+static void txn_foreach_cb(void *elm, void *userdata)
+{
+    (void)userdata;
+    printf("%d ", ((struct item *)elm)->value);
+}
+
 static void *thread_insert_remove(void *arg)
 {
     (void)arg;
@@ -79,6 +85,62 @@ int main(void)
     printf("size after concurrent ops: %zu\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
 
     /* Drain and free remaining */
+    while ((p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
+        free(p);
+
+    /* --- Transaction demo --- */
+    struct item *x = malloc(sizeof(*x));
+    struct item *y = malloc(sizeof(*y));
+    struct item *z = malloc(sizeof(*z));
+    if (x && y && z) {
+        x->value = 1;
+        y->value = 2;
+        z->value = 3;
+        CONCURRENT_LIST_INSERT_TAIL(lst_p, x, link);
+        CONCURRENT_LIST_INSERT_TAIL(lst_p, y, link);
+        CONCURRENT_LIST_INSERT_TAIL(lst_p, z, link);
+    }
+
+    concurrent_list_txn_t *txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
+    if (txn) {
+        printf("txn view (snapshot): ");
+        CONCURRENT_LIST_TXN_FOREACH(txn, txn_foreach_cb, NULL);
+        printf("\n");
+
+        /* Buffered insert/remove in txn (list unchanged until commit) */
+        struct item *w = malloc(sizeof(*w));
+        if (w) {
+            w->value = 99;
+            CONCURRENT_LIST_TXN_INSERT_TAIL(txn, w, link);
+        }
+        if (y)
+            CONCURRENT_LIST_TXN_REMOVE(txn, y, link);
+
+        printf("txn view after insert 99, remove 2: ");
+        CONCURRENT_LIST_TXN_FOREACH(txn, txn_foreach_cb, NULL);
+        printf("\n");
+
+        concurrent_list_txn_commit(txn);
+        printf("after commit: size=%zu\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
+    }
+
+    /* Rollback demo: txn changes are discarded */
+    if (x && z) {
+        txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
+        if (txn) {
+            struct item *tmp = malloc(sizeof(*tmp));
+            if (tmp) {
+                tmp->value = 100;
+                CONCURRENT_LIST_TXN_INSERT_HEAD(txn, tmp, link);
+            }
+            CONCURRENT_LIST_TXN_REMOVE(txn, x, link);
+            concurrent_list_txn_rollback(txn);
+            if (tmp)
+                free(tmp);
+        }
+        printf("after rollback: size=%zu (unchanged)\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
+    }
+
     while ((p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
         free(p);
 

@@ -294,3 +294,163 @@ void *concurrent_list_next_(void *elm, size_t offset)
     }
     return NULL;
 }
+
+/* --- Transaction support --- */
+
+#define TXN_INIT_CAP 8
+
+static int append(void ***arr, size_t *n, size_t *cap, void *ptr)
+{
+    if (*n >= *cap) {
+        size_t new_cap = (*cap == 0) ? TXN_INIT_CAP : *cap * 2;
+        void **p = (void **)realloc(*arr, new_cap * sizeof(void *));
+        if (!p)
+            return -1;
+        *arr = p;
+        *cap = new_cap;
+    }
+    (*arr)[(*n)++] = ptr;
+    return 0;
+}
+
+static int ptr_in(void **arr, size_t n, const void *ptr)
+{
+    for (size_t i = 0; i < n; i++)
+        if (arr[i] == ptr)
+            return 1;
+    return 0;
+}
+
+static void remove_from(void **arr, size_t *n, const void *ptr)
+{
+    for (size_t i = 0; i < *n; i++) {
+        if (arr[i] == ptr) {
+            (*n)--;
+            arr[i] = arr[*n];
+            return;
+        }
+    }
+}
+
+struct concurrent_list_txn {
+    atomic_uintptr_t *head;
+    void (*free_cb)(void *);
+    size_t offset;
+    void **snapshot;
+    size_t n_snapshot;
+    void **inserted_head;
+    size_t n_ins_head;
+    size_t cap_ins_head;
+    void **inserted_tail;
+    size_t n_ins_tail;
+    size_t cap_ins_tail;
+    void **removed;
+    size_t n_removed;
+    size_t cap_removed;
+};
+
+concurrent_list_txn_t *concurrent_list_txn_start_(atomic_uintptr_t *head,
+    void (*free_cb)(void *), size_t offset)
+{
+    concurrent_list_txn_t *txn = (concurrent_list_txn_t *)calloc(1, sizeof(*txn));
+    if (!txn)
+        return NULL;
+    txn->head = head;
+    txn->free_cb = free_cb;
+    txn->offset = offset;
+    /* inserted_* and removed start empty; append() will allocate on first use */
+
+    size_t cap = 0;
+    void *curr = concurrent_list_first_(head, offset);
+    while (curr) {
+        if (append(&txn->snapshot, &txn->n_snapshot, &cap, curr) != 0) {
+            free(txn->snapshot);
+            free(txn->inserted_head);
+            free(txn->inserted_tail);
+            free(txn->removed);
+            free(txn);
+            return NULL;
+        }
+        curr = concurrent_list_next_(curr, offset);
+    }
+    return txn;
+}
+
+void concurrent_list_txn_insert_head_(concurrent_list_txn_t *txn, void *elm)
+{
+    append(&txn->inserted_head, &txn->n_ins_head, &txn->cap_ins_head, elm);
+}
+
+void concurrent_list_txn_insert_tail_(concurrent_list_txn_t *txn, void *elm)
+{
+    append(&txn->inserted_tail, &txn->n_ins_tail, &txn->cap_ins_tail, elm);
+}
+
+void concurrent_list_txn_remove_(concurrent_list_txn_t *txn, void *elm)
+{
+    if (ptr_in(txn->inserted_head, txn->n_ins_head, elm)) {
+        remove_from(txn->inserted_head, &txn->n_ins_head, elm);
+        return;
+    }
+    if (ptr_in(txn->inserted_tail, txn->n_ins_tail, elm)) {
+        remove_from(txn->inserted_tail, &txn->n_ins_tail, elm);
+        return;
+    }
+    if (ptr_in(txn->snapshot, txn->n_snapshot, elm) && !ptr_in(txn->removed, txn->n_removed, elm))
+        append(&txn->removed, &txn->n_removed, &txn->cap_removed, elm);
+}
+
+bool concurrent_list_txn_contains_(concurrent_list_txn_t *txn, const void *elm)
+{
+    if (ptr_in(txn->inserted_head, txn->n_ins_head, elm))
+        return true;
+    if (ptr_in(txn->inserted_tail, txn->n_ins_tail, elm))
+        return true;
+    if (ptr_in(txn->snapshot, txn->n_snapshot, elm) && !ptr_in(txn->removed, txn->n_removed, elm))
+        return true;
+    return false;
+}
+
+void concurrent_list_txn_foreach_(concurrent_list_txn_t *txn,
+    concurrent_list_txn_foreach_fn cb, void *userdata)
+{
+    for (size_t i = 0; i < txn->n_snapshot; i++) {
+        void *p = txn->snapshot[i];
+        if (!ptr_in(txn->removed, txn->n_removed, p))
+            cb(p, userdata);
+    }
+    for (size_t i = txn->n_ins_head; i > 0; i--)
+        cb(txn->inserted_head[i - 1], userdata);
+    for (size_t i = 0; i < txn->n_ins_tail; i++)
+        cb(txn->inserted_tail[i], userdata);
+}
+
+int concurrent_list_txn_commit(concurrent_list_txn_t *txn)
+{
+    atomic_uintptr_t *head = txn->head;
+    size_t offset = txn->offset;
+    void (*free_cb)(void *) = txn->free_cb;
+
+    for (size_t i = 0; i < txn->n_removed; i++)
+        concurrent_list_remove_(head, free_cb, txn->removed[i], offset);
+    for (size_t i = 0; i < txn->n_ins_tail; i++)
+        concurrent_list_insert_tail_(head, txn->inserted_tail[i], offset);
+    for (size_t i = txn->n_ins_head; i > 0; i--)
+        concurrent_list_insert_head_(head, txn->inserted_head[i - 1], offset);
+
+    free(txn->snapshot);
+    free(txn->inserted_head);
+    free(txn->inserted_tail);
+    free(txn->removed);
+    free(txn);
+    return 0;
+}
+
+void concurrent_list_txn_rollback(concurrent_list_txn_t *txn)
+{
+    free(txn->snapshot);
+    free(txn->inserted_head);
+    free(txn->inserted_tail);
+    free(txn->removed);
+    free(txn);
+}

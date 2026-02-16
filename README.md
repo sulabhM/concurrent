@@ -7,6 +7,7 @@ A lock-free, thread-safe singly linked list in C using C11 atomics. The API is g
 - **Lock-free**: Harris-style list with hazard pointers; no mutexes.
 - **Generic**: Works with any struct; you define the element type and embed `CONCURRENT_LIST_ENTRY(type, name)`.
 - **BSD-style macros**: Similar to `sys/queue.h` (e.g. `CONCURRENT_LIST_INSERT_HEAD`, `CONCURRENT_LIST_REMOVE_HEAD`, `CONCURRENT_LIST_FOREACH`).
+- **Transactions**: Start a transaction to see a snapshot of the list; other threads can keep modifying the list. Buffered inserts/removes are applied on commit or discarded on rollback.
 
 ## Build
 
@@ -41,6 +42,20 @@ CONCURRENT_LIST_INSERT_HEAD(lst_p, a, link);
 
 struct item *p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link);
 if (p) free(p);
+```
+
+### Transactions
+
+```c
+concurrent_list_txn_t *txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
+if (txn) {
+    /* Walk snapshot; other threads can add/remove meanwhile */
+    CONCURRENT_LIST_TXN_FOREACH(txn, my_callback, userdata);
+    CONCURRENT_LIST_TXN_INSERT_TAIL(txn, new_elm, link);
+    CONCURRENT_LIST_TXN_REMOVE(txn, old_elm, link);
+    concurrent_list_txn_commit(txn);   /* apply changes */
+    /* or concurrent_list_txn_rollback(txn); to discard */
+}
 ```
 
 See `include/concurrent_list.h` for the full API and `src/main.c` for a demo.

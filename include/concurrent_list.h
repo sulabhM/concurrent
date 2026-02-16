@@ -118,6 +118,80 @@ extern "C" {
          (var) != NULL;                                                   \
          (var) = (type *)concurrent_list_next_((void *)(var), (size_t)offsetof(type, field)))
 
+/*
+ * --- Transactions ---
+ * Start a transaction to see a snapshot of the list and buffer inserts/removes.
+ * Other threads can keep modifying the list; you see contents as of txn start.
+ * Commit applies your changes to the list; rollback discards them.
+ * Only one thread should use a given txn at a time.
+ */
+
+typedef struct concurrent_list_txn concurrent_list_txn_t;
+
+/** Callback for CONCURRENT_LIST_TXN_FOREACH: (element, userdata). */
+typedef void (*concurrent_list_txn_foreach_fn)(void *elm, void *userdata);
+
+/**
+ * Start a transaction. Captures a snapshot of the list; other threads can
+ * continue to add/remove. Returns NULL on allocation failure.
+ */
+#define CONCURRENT_LIST_TXN_START(headp, type, field)                     \
+    concurrent_list_txn_start_(&((headp)->head), (void (*)(void *))(headp)->free_cb, \
+        (size_t)offsetof(type, field))
+
+/**
+ * Insert at head (in transaction view). Applied to the list on commit.
+ */
+#define CONCURRENT_LIST_TXN_INSERT_HEAD(txn, elm, field)                   \
+    concurrent_list_txn_insert_head_((txn), (void *)(elm))
+
+/**
+ * Insert at tail (in transaction view). Applied to the list on commit.
+ */
+#define CONCURRENT_LIST_TXN_INSERT_TAIL(txn, elm, field)                  \
+    concurrent_list_txn_insert_tail_((txn), (void *)(elm))
+
+/**
+ * Remove element from the transaction view. Applied to the list on commit
+ * (no-op if element was not in the snapshot or was already removed).
+ */
+#define CONCURRENT_LIST_TXN_REMOVE(txn, elm, field)                        \
+    concurrent_list_txn_remove_((txn), (void *)(elm))
+
+/**
+ * Return true if elm is in the transaction view (snapshot minus removed,
+ * plus inserted).
+ */
+#define CONCURRENT_LIST_TXN_CONTAINS(txn, elm, field)                      \
+    concurrent_list_txn_contains_((txn), (void *)(elm))
+
+/**
+ * Call cb(elm, userdata) for each element in the transaction view, in order.
+ */
+#define CONCURRENT_LIST_TXN_FOREACH(txn, cb, userdata)                    \
+    concurrent_list_txn_foreach_((txn), (cb), (userdata))
+
+/**
+ * Commit: apply all buffered removes then inserts to the list. Frees the txn;
+ * do not use txn after this. Returns 0 on success.
+ */
+int concurrent_list_txn_commit(concurrent_list_txn_t *txn);
+
+/**
+ * Rollback: discard all buffered changes and free the txn. Do not use txn after this.
+ */
+void concurrent_list_txn_rollback(concurrent_list_txn_t *txn);
+
+/* Internal (used by macros). */
+concurrent_list_txn_t *concurrent_list_txn_start_(atomic_uintptr_t *head,
+    void (*free_cb)(void *), size_t offset);
+void concurrent_list_txn_insert_head_(concurrent_list_txn_t *txn, void *elm);
+void concurrent_list_txn_insert_tail_(concurrent_list_txn_t *txn, void *elm);
+void concurrent_list_txn_remove_(concurrent_list_txn_t *txn, void *elm);
+bool concurrent_list_txn_contains_(concurrent_list_txn_t *txn, const void *elm);
+void concurrent_list_txn_foreach_(concurrent_list_txn_t *txn,
+    concurrent_list_txn_foreach_fn cb, void *userdata);
+
 /* Internal API (used by macros; do not call directly with wrong offset). */
 void concurrent_list_init_(atomic_uintptr_t *head);
 void concurrent_list_insert_head_(atomic_uintptr_t *head, void *elm, size_t offset);
