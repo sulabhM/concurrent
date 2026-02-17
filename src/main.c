@@ -1,7 +1,7 @@
 /**
- * Demo: BSD-style concurrent list macros with a custom struct.
+ * Demo: BSD-style linked list macros with a custom struct.
  */
-#include "concurrent_list.h"
+#include "list.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -9,11 +9,11 @@
 /* Define an element type and embed the list entry. */
 struct item {
     int value;
-    CONCURRENT_LIST_ENTRY(item, link);
+    LL_ENTRY(item, link);
 };
 
 /* Declare a list head type for this element type. */
-CONCURRENT_LIST_HEAD(list_head, item);
+LL_HEAD(list_head, item);
 
 static struct list_head lst;
 #define NUM_THREADS 4
@@ -33,11 +33,11 @@ static void *thread_insert_remove(void *arg)
     for (int i = 0; i < OPS_PER_THREAD; i++) {
         struct item *a = malloc(sizeof(*a));
         struct item *b = malloc(sizeof(*b));
-        if (a) { a->value = i; CONCURRENT_LIST_INSERT_HEAD(g_lst, a, link); }
-        if (b) { b->value = i + 1000; CONCURRENT_LIST_INSERT_TAIL(g_lst, b, link); }
+        if (a) { a->value = i; LL_INSERT_HEAD(g_lst, a, link); }
+        if (b) { b->value = i + 1000; LL_INSERT_TAIL(g_lst, b, link); }
     }
     for (int i = 0; i < OPS_PER_THREAD; i++) {
-        struct item *p = CONCURRENT_LIST_REMOVE_HEAD(g_lst, struct item, link);
+        struct item *p = LL_REMOVE_HEAD(g_lst, struct item, link);
         if (p)
             free(p);
     }
@@ -47,7 +47,7 @@ static void *thread_insert_remove(void *arg)
 int main(void)
 {
     struct list_head *lst_p = &lst;
-    CONCURRENT_LIST_INIT(lst_p);
+    LL_INIT(lst_p);
 
     /* Single-threaded API usage */
     struct item *a = malloc(sizeof(*a));
@@ -60,19 +60,19 @@ int main(void)
     a->value = 10;
     b->value = 20;
     c->value = 30;
-    CONCURRENT_LIST_INSERT_HEAD(lst_p, a, link);
-    CONCURRENT_LIST_INSERT_HEAD(lst_p, b, link);
-    CONCURRENT_LIST_INSERT_TAIL(lst_p, c, link);
+    LL_INSERT_HEAD(lst_p, a, link);
+    LL_INSERT_HEAD(lst_p, b, link);
+    LL_INSERT_TAIL(lst_p, c, link);
 
-    printf("size after inserts: %zu\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
-    printf("contains b: %d\n", CONCURRENT_LIST_CONTAINS(lst_p, b, link));
+    printf("size after inserts: %zu\n", LL_SIZE(lst_p, struct item, link));
+    printf("contains b: %d\n", LL_CONTAINS(lst_p, b, link));
 
     struct item *p;
-    while ((p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link)) != NULL) {
+    while ((p = LL_REMOVE_HEAD(lst_p, struct item, link)) != NULL) {
         printf("popped %d\n", p->value);
         free(p);
     }
-    printf("is_empty: %d\n", CONCURRENT_LIST_IS_EMPTY(lst_p));
+    printf("is_empty: %d\n", LL_IS_EMPTY(lst_p));
 
     /* Multi-threaded stress */
     g_lst = lst_p;
@@ -82,10 +82,10 @@ int main(void)
     for (int i = 0; i < NUM_THREADS; i++)
         pthread_join(threads[i], NULL);
 
-    printf("size after concurrent ops: %zu\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
+    printf("size after concurrent ops: %zu\n", LL_SIZE(lst_p, struct item, link));
 
     /* Drain and free remaining */
-    while ((p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
+    while ((p = LL_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
         free(p);
 
     /* --- Transaction demo --- */
@@ -96,52 +96,52 @@ int main(void)
         x->value = 1;
         y->value = 2;
         z->value = 3;
-        CONCURRENT_LIST_INSERT_TAIL(lst_p, x, link);
-        CONCURRENT_LIST_INSERT_TAIL(lst_p, y, link);
-        CONCURRENT_LIST_INSERT_TAIL(lst_p, z, link);
+        LL_INSERT_TAIL(lst_p, x, link);
+        LL_INSERT_TAIL(lst_p, y, link);
+        LL_INSERT_TAIL(lst_p, z, link);
     }
 
-    concurrent_list_txn_t *txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
+    ll_txn_t *txn = LL_TXN_START(lst_p, struct item, link);
     if (txn) {
         printf("txn view (snapshot): ");
-        CONCURRENT_LIST_TXN_FOREACH(txn, txn_foreach_cb, NULL);
+        LL_TXN_FOREACH(txn, txn_foreach_cb, NULL);
         printf("\n");
 
         /* Buffered insert/remove in txn (list unchanged until commit) */
         struct item *w = malloc(sizeof(*w));
         if (w) {
             w->value = 99;
-            CONCURRENT_LIST_TXN_INSERT_TAIL(txn, w, link);
+            LL_TXN_INSERT_TAIL(txn, w, link);
         }
         if (y)
-            CONCURRENT_LIST_TXN_REMOVE(txn, y, link);
+            LL_TXN_REMOVE(txn, y, link);
 
         printf("txn view after insert 99, remove 2: ");
-        CONCURRENT_LIST_TXN_FOREACH(txn, txn_foreach_cb, NULL);
+        LL_TXN_FOREACH(txn, txn_foreach_cb, NULL);
         printf("\n");
 
-        concurrent_list_txn_commit(txn);
-        printf("after commit: size=%zu\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
+        ll_txn_commit(txn);
+        printf("after commit: size=%zu\n", LL_SIZE(lst_p, struct item, link));
     }
 
     /* Rollback demo: txn changes are discarded */
     if (x && z) {
-        txn = CONCURRENT_LIST_TXN_START(lst_p, struct item, link);
+        txn = LL_TXN_START(lst_p, struct item, link);
         if (txn) {
             struct item *tmp = malloc(sizeof(*tmp));
             if (tmp) {
                 tmp->value = 100;
-                CONCURRENT_LIST_TXN_INSERT_HEAD(txn, tmp, link);
+                LL_TXN_INSERT_HEAD(txn, tmp, link);
             }
-            CONCURRENT_LIST_TXN_REMOVE(txn, x, link);
-            concurrent_list_txn_rollback(txn);
+            LL_TXN_REMOVE(txn, x, link);
+            ll_txn_rollback(txn);
             if (tmp)
                 free(tmp);
         }
-        printf("after rollback: size=%zu (unchanged)\n", CONCURRENT_LIST_SIZE(lst_p, struct item, link));
+        printf("after rollback: size=%zu (unchanged)\n", LL_SIZE(lst_p, struct item, link));
     }
 
-    while ((p = CONCURRENT_LIST_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
+    while ((p = LL_REMOVE_HEAD(lst_p, struct item, link)) != NULL)
         free(p);
 
     return 0;
