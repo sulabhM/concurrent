@@ -10,3 +10,12 @@ add_executable(${PROJECT_NAME}
     src/list.c
 )
 target_link_libraries(${PROJECT_NAME} pthread)
+
+add_executable(test_list
+    src/test_list.c
+    src/list.c
+)
+target_link_libraries(test_list pthread)
+
+enable_testing()
+add_test(NAME test_list COMMAND test_list)

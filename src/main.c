@@ -64,6 +64,9 @@ int main(void)
     LL_INSERT_HEAD(lst_p, b, link);
     LL_INSERT_TAIL(lst_p, c, link);
 
+    /* Insert in middle: after b (value 10) */
+    struct item *d = malloc(sizeof(*d));
+    if (d) { d->value = 15; LL_INSERT_AFTER(lst_p, b, d, link); }  /* list: b, d, a, c */
     printf("size after inserts: %zu\n", LL_SIZE(lst_p, struct item, link));
     printf("contains b: %d\n", LL_CONTAINS(lst_p, b, link));
 
@@ -113,10 +116,15 @@ int main(void)
             w->value = 99;
             LL_TXN_INSERT_TAIL(txn, w, link);
         }
+        struct item *mid = malloc(sizeof(*mid));
+        if (mid) {
+            mid->value = 42;
+            LL_TXN_INSERT_AFTER(txn, x, mid, link);  /* insert 42 after 1 → view: 1 42 2 3 */
+        }
         if (y)
             LL_TXN_REMOVE(txn, y, link);
 
-        printf("txn view after insert 99, remove 2: ");
+        printf("txn view after insert 42 after 1, 99 at tail, remove 2: ");
         LL_TXN_FOREACH(txn, txn_foreach_cb, NULL);
         printf("\n");
 

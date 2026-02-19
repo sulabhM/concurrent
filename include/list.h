@@ -80,6 +80,13 @@ extern "C" {
     ll_insert_tail_(&((headp)->head), &((headp)->commit_id), (void *)(elm))
 
 /*
+ * Insert element after the node containing after_elm (by pointer). Lock-free;
+ * uses current commit_id snapshot to find after_elm. No-op if after_elm not in list.
+ */
+#define LL_INSERT_AFTER(headp, after_elm, elm, field)                       \
+    ll_insert_after_(&((headp)->head), &((headp)->commit_id), (void *)(after_elm), (void *)(elm))
+
+/*
  * Remove and return the element at the head. Returns NULL if empty.
  * "type" is the element struct type; "field" is the list entry member name.
  * Caller may free the returned element when no longer needed.
@@ -93,7 +100,7 @@ extern "C" {
  * not free the element until no thread can reference it (e.g. by design).
  */
 #define LL_REMOVE(headp, elm, field)                        \
-    ll_remove_(&((headp)->head), &((headp)->commit_id), (headp)->free_cb, (void *)(elm))
+    ll_remove_(&((headp)->head), &((headp)->commit_id), (void (*)(void *))(headp)->free_cb, (void *)(elm))
 
 /*
  * Return true if "elm" is in the list (by pointer equality).
@@ -142,10 +149,22 @@ void *ll_iter_get(ll_iter_t *it);
         if (((var) = (type *)ll_iter_get(&_ll_it)) != NULL)
 
 /*
+ * --- Snapshot visibility ---
+ * Each change is tagged with a commit_id (transaction id). When walking or
+ * searching, a read uses a snapshot S (e.g. commit_id at txn start or at
+ * iter_begin). A node is visible (committed) at S iff insert_txn_id <= S and
+ * (removed_txn_id == 0 || removed_txn_id > S). Nodes with removed_txn_id set
+ * but not yet reclaimed are logically removed for that snapshot. Thus the
+ * snapshot determines which nodes are committed vs in progress of being
+ * modified (removed).
+ */
+
+/*
  * --- Transactions ---
  * Start a transaction to see a snapshot of the list and buffer inserts/removes.
  * Other threads can keep modifying the list; you see contents as of txn start.
  * Commit applies your changes to the list; rollback discards them.
+ * Insert/remove anywhere: head, tail, or after a given element.
  * Only one thread should use a given txn at a time.
  */
 
@@ -172,6 +191,13 @@ typedef void (*ll_txn_foreach_fn)(void *elm, void *userdata);
  */
 #define LL_TXN_INSERT_TAIL(txn, elm, field)                   \
     ll_txn_insert_tail_((txn), (void *)(elm))
+
+/**
+ * Insert elm after after_elm (in transaction view). Applied to the list on commit.
+ * Multiple insert_after with the same anchor are applied in call order.
+ */
+#define LL_TXN_INSERT_AFTER(txn, after_elm, elm, field)       \
+    ll_txn_insert_after_((txn), (void *)(after_elm), (void *)(elm))
 
 /**
  * Remove element from the transaction view. Applied to the list on commit
@@ -209,6 +235,7 @@ ll_txn_t *ll_txn_start_(atomic_uintptr_t *head,
     ll_commit_id_t *commit_id, void (*free_cb)(void *));
 void ll_txn_insert_head_(ll_txn_t *txn, void *elm);
 void ll_txn_insert_tail_(ll_txn_t *txn, void *elm);
+void ll_txn_insert_after_(ll_txn_t *txn, void *after_elm, void *elm);
 void ll_txn_remove_(ll_txn_t *txn, void *elm);
 bool ll_txn_contains_(ll_txn_t *txn, const void *elm);
 void ll_txn_foreach_(ll_txn_t *txn,
@@ -218,6 +245,7 @@ void ll_txn_foreach_(ll_txn_t *txn,
 void ll_init_(atomic_uintptr_t *head, ll_commit_id_t *commit_id);
 void ll_insert_head_(atomic_uintptr_t *head, ll_commit_id_t *commit_id, void *elm);
 void ll_insert_tail_(atomic_uintptr_t *head, ll_commit_id_t *commit_id, void *elm);
+void ll_insert_after_(atomic_uintptr_t *head, ll_commit_id_t *commit_id, void *after_elm, void *elm);
 void *ll_remove_head_(atomic_uintptr_t *head, ll_commit_id_t *commit_id);
 int ll_remove_(atomic_uintptr_t *head, ll_commit_id_t *commit_id, void (*free_cb)(void *), void *elm);
 bool ll_contains_(atomic_uintptr_t *head, ll_commit_id_t *commit_id, const void *elm);
